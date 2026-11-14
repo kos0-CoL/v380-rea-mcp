@@ -1,0 +1,10 @@
+# V380 MCP Server Requirements
+# Python 3.8+
+
+# Core dependencies (stdlib only for basic server)
+# For full implementation with crypto:
+# cryptography>=41.0.0
+# pycryptodome>=3.18.0
+
+# For async version:
+# aiohttp>=3.8.0
