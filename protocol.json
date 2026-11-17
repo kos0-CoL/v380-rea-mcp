@@ -1,18 +1,18 @@
 {
   "protocol": "V380 Camera Protocol (Aliothings/AliOS Things variant)",
-  "version": "1.0",
+  "version": "1.1",
   "analysis_source": "REA/Ghidra analysis of libhsMediaLibrary.so, libhsUtils.so, libnms.so, libzerolink.so from com.macrovideo.v380pro.apk",
   "transport": {
-    "control": "TCP",
+    "control": "TCP (mr_tcp_connect)",
     "video": "UDP",
     "default_port": 5050,
-    "discovery": "NOT NVDEVSEARCH^100 - uses MQTT/P2P"
+    "discovery": "NOT NVDEVSEARCH^100 - uses MQTT/P2P via callbackMqErrorStartP2p"
   },
   "session_management": {
     "login": "LoginHelper.login(context, deviceInfo, 5) for P2P",
     "key_exchange": [
       "LoginHelper.keyExchangeFromMqSync",
-      "LoginHelper.keyExchangeByLanSync",
+      "LoginHelper.keyExchangeByLanSync", 
       "LoginHelper.keyExchangeFromHttpsSync"
     ],
     "token_refresh": [
@@ -49,9 +49,25 @@
       "mvt_cipher_start",
       "mvt_cipher_process",
       "mvt_cipher_finish"
-    ]
+    ],
+    "frame_info_struct": {
+      "name": "_media_stream_frame_trans_info",
+      "size": 312,
+      "fields": [
+        "cipher_mode (1=decrypt, 2=encrypt)",
+        "frame_type",
+        "key[16]",
+        "iv[16]",
+        "additional_data[280]"
+      ]
+    }
   },
   "video": {
+    "frame_types": {
+      "1": "VIDEO_FRAME (H.264/H.265)",
+      "2": "AUDIO_FRAME (ADPCM)",
+      "4": "OTHER/Metadata"
+    },
     "frame_header": {
       "size": 20,
       "fields": [
@@ -64,30 +80,52 @@
         {"name": "ts_high", "offset": 32, "type": "uint32"}
       ]
     },
-    "frame_types": {
-      "0": "I_FRAME",
-      "2": "P_FRAME",
-      "9": "IDR_FRAME",
-      "36": "SPS_PPS",
-      "40": "SEI",
-      "50": "AUD",
-      "52": "FILLER"
+    "tagFrameData": {
+      "fields": {
+        "+0": "frame_type (1=video, 2=audio, 4=other)",
+        "+4": "timestamp",
+        "+8": "sub_type",
+        "+0xc": "frame_subtype",
+        "+0x10": "pts_low",
+        "+0x14": "pts_high",
+        "+0x18": "width",
+        "+0x1c": "height",
+        "+0x20": "data_size",
+        "+0x24": "data_offset",
+        "+0x28": "flags",
+        "+0x2c": "sequence",
+        "+0x30": "stream_id",
+        "+0x44": "extra_data"
+      }
     },
-    "key_frame_types": [0, 2, 9, 36, 40, 50, 52],
     "fifo_queue": {
       "capacity": 100,
       "frame_header_size": 20,
-      "functions": ["PutFIFOVedioData", "GetFIFOData", "InitFIFOQueueManager"]
-    }
+      "functions": [
+        "PutFIFOVedioData",
+        "GetFIFOData", 
+        "InitFIFOQueueManager",
+        "InitQueueManager",
+        "InitFrameCountQueueManager"
+      ]
+    },
+    "flow": [
+      "startPlay() -> HSMediaManager::startPlay(tagPlayParam)",
+      "-> callbackPreviewReq() -> callbackPreviewRes()",
+      "-> onRecvFrameData(tagFrameData*)",
+      "-> PutFileFrameDataTime3() / PutAudioDataEX()"
+    ]
   },
   "ptz": {
     "setPTZParam": {
       "params": 11,
-      "signature": "setPTZParam(handle, cmd, bool1, param1, bool2, param2, bool3, bool4, bool5, bool6, param3)"
+      "signature": "setPTZParam(handle, cmd, bool1, param1, bool2, param2, bool3, bool4, bool5, bool6, param3)",
+      "jni": "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZParam"
     },
     "setPTZXParam": {
       "params": 3,
-      "signature": "setPTZXParam(handle, param1, param2, param3)"
+      "signature": "setPTZXParam(handle, param1, param2, param3)",
+      "jni": "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZXParam"
     },
     "ranges": {
       "pan": [-100, 100],
@@ -126,14 +164,14 @@
     }
   },
   "jni_exports": {
-    "Java_com_macrovideo_sdk_media_HSMediaLibrary_startPlay": "0x79e09",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_startPlay": "0x89e08",
     "Java_com_macrovideo_sdk_media_HSMediaLibrary_stopPlay": "0x79f1d",
-    "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZParam": "0x7a7cd",
-    "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZXParam": "0x7a619",
-    "Java_com_macrovideo_sdk_media_HSMediaLibrary_refreshIpPortHandleToken": "0x807b9",
-    "Java_com_macrovideo_sdk_media_HSMediaLibrary_refreshMqKeyExchangeInfo": "0x80add",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZParam": "0x8a7cc",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZXParam": "0x8a619",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_refreshIpPortHandleToken": "0x907b8",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_refreshMqKeyExchangeInfo": "0x90adc",
     "Java_com_macrovideo_sdk_media_HSMediaLibrary_updateLoginHandle": "0x7d3ad",
-    "Java_com_macrovideo_sdk_media_HSMediaLibrary_cipherFileData": "0x7f419",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_cipherFileData": "0x8f418",
     "Java_com_macrovideo_sdk_media_HSMediaLibrary_sendSpeakAudioData": "0x7ab01"
   },
   "native_symbols": {
@@ -141,11 +179,32 @@
     "HSLiveDataBaseTransmitter::refreshIpPortHandleToken": "_ZN25HSLiveDataBaseTransmitter24refreshIpPortHandleTokenEPKcS1_iiS1_",
     "HSLiveDataBaseTransmitter::refreshMqKeyExchangeInfo": "_ZN25HSLiveDataBaseTransmitter24refreshMqKeyExchangeInfoEPKcS1_S1_",
     "HSLiveDataBaseTransmitter::callbackMqErrorStartP2p": "_ZN25HSLiveDataBaseTransmitter23callbackMqErrorStartP2pEv",
+    "HSLiveDataBaseTransmitter::callbackPreviewReq": "_ZN25HSLiveDataBaseTransmitter18callbackPreviewReqEiibbbiPKc",
+    "HSLiveDataBaseTransmitter::callbackPreviewRes": "_ZN25HSLiveDataBaseTransmitter18callbackPreviewResEiibbbiPKc",
+    "HSLiveDataBaseTransmitter::callbackPreviewTrace": "_ZN25HSLiveDataBaseTransmitter20callbackPreviewTraceEPKcS1_iS1_xxibiiS1_S1_",
+    "HSLiveDataBaseTransmitter::callbackPreviewPlayFail": "_ZN25HSLiveDataBaseTransmitter23callbackPreviewPlayFailEv",
     "iotc_ms_frame_cipher_init": "_Z25iotc_ms_frame_cipher_initP30_media_stream_frame_trans_infohhPhS1_",
     "iotc_ms_frame_cipher": "_Z20iotc_ms_frame_cipherP30_media_stream_frame_trans_infoh",
     "iotc_ms_frame_cipher_end": "_Z24iotc_ms_frame_cipher_endP30_media_stream_frame_trans_info",
     "mr_tcp_connect": "mr_tcp_connect",
     "media_data_decrypt": "media_data_decrypt",
-    "media_data_encrypt": "media_data_encrypt"
+    "media_data_encrypt": "media_data_encrypt",
+    "HSMediaManager::startPlay": "startPlay",
+    "HSMediaManager::setPTZParam": "setPTZParam",
+    "HSMediaManager::refreshIpPortHandleToken": "refreshIpPortHandleToken",
+    "HSMediaManager::refreshMqKeyExchangeInfo": "refreshMqKeyExchangeInfo",
+    "HSReplayPlayer::onRecvFrameData": "onRecvFrameData",
+    "HSReplayPlayer::refreshIpPortHandleToken": "refreshIpPortHandleToken"
+  },
+  "smartlink": {
+    "library": "libzerolink.so",
+    "functions": [
+      "StartSmartConnection",
+      "StopSmartConnection",
+      "Scan",
+      "udp_create_connect_send",
+      "doconnect"
+    ],
+    "provisioning": "WiFi provisioning via UDP broadcast (228.84.85.%d)"
   }
 }
