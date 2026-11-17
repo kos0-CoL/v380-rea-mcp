@@ -7,6 +7,7 @@ __pycache__/
 venv/
 env/
 ENV/
+.venv/
 
 # IDE
 .vscode/
@@ -26,3 +27,7 @@ Thumbs.db
 # Binary files from REA
 *.so
 *.apk
+
+# Test output
+*.pcap
+*.pcapng

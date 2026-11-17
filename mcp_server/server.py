@@ -1,300 +1,300 @@
 """
-V380 Camera MCP Server Implementation
-UDP-based server handling V380 camera protocol.
+V380 Camera MCP Server
+FastMCP-based server exposing camera control tools.
 """
-import socket
-import json
-import threading
-import time
-import struct
-import hashlib
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Callable, Any
-from enum import IntEnum
+import os
 import logging
+from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from mcp.server.fastmcp import FastMCP, Context
 
+from .protocol import V380ProtocolClient, CameraConfig
 
-class CommandCode(IntEnum):
-    """V380 command codes from protocol analysis."""
-    SPEAK_AUDIO = 0x30200
-    KEEP_ALIVE = 0x3030a
-    GENERAL_CTRL = 0x30300
-    PTZ_ACTION = 0x30308
-    PTZ_PRESET = 0x30202
-    PLAYBACK_CTRL = 0x30222
-    PTZ_ZOOM = 0x60200
-    PTZ_FOCUS = 0x60201
-    PTZ_IRIS = 0x60203
-    PTZ_OTHER = 0x60204
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("v380-mcp")
 
-
-class FrameType(IntEnum):
-    """Video frame types."""
-    I_FRAME = 0
-    P_FRAME = 2
-    IDR_FRAME = 9
-    SPS_PPS = 36
-    SEI = 40
-    AUD = 50
-    FILLER = 52
+# Global camera client
+_camera_client: Optional[V380ProtocolClient] = None
 
 
-KEY_FRAME_TYPES = {0, 2, 9, 36, 40, 50, 52}
-
-
-@dataclass
-class Session:
-    """Camera session state."""
-    sid: int
-    skey: bytes  # 16 bytes
-    device_id: int
-    handle: int
-    ip: str
-    port: int
-    token: str = ""
-    last_keepalive: float = 0
-    expires_at: float = 0
-
-
-@dataclass
-class FrameHeader:
-    """Video frame header (20 bytes)."""
-    offset: int
-    size: int
-    frame_type: int
-    flags1: int
-    flags2: int
-    ts_low: int
-    ts_high: int
-
-    @classmethod
-    def parse(cls, data: bytes) -> "FrameHeader":
-        if len(data) < 20:
-            raise ValueError("Frame header too short")
-        offset, size, ftype, f1, f2, ts_low, ts_high = struct.unpack(
-            "<IIBBBII", data[:20]
+def get_camera_client() -> V380ProtocolClient:
+    """Get or create the global camera client."""
+    global _camera_client
+    if _camera_client is None:
+        config = CameraConfig(
+            ip=os.getenv("CAMERA_IP", "192.168.1.169"),
+            port=int(os.getenv("CAMERA_PORT", "5050")),
+            uid=os.getenv("CAMERA_ID", ""),
+            username=os.getenv("CAMERA_USER", "admin"),
+            password=os.getenv("CAMERA_PASS", ""),
+            use_ssl=os.getenv("CAMERA_SSL", "false").lower() == "true"
         )
-        return cls(offset, size, ftype, f1, f2, ts_low, ts_high)
-
-    def is_key_frame(self) -> bool:
-        return self.frame_type in KEY_FRAME_TYPES
-
-
-class V380MCPServer:
-    """Main MCP server for V380 cameras."""
-
-    def __init__(self, host: str = "0.0.0.0", port: int = 5050):
-        self.host = host
-        self.port = port
-        self.sock: Optional[socket.socket] = None
-        self.running = False
-        self.sessions: Dict[str, Session] = {}  # key: f"{ip}:{port}"
-        self.command_handlers: Dict[int, Callable] = {}
-        self._register_handlers()
-
-    def _register_handlers(self):
-        """Register command handlers."""
-        self.command_handlers = {
-            CommandCode.KEEP_ALIVE: self._handle_keepalive,
-            CommandCode.PTZ_ACTION: self._handle_ptz_action,
-            CommandCode.PTZ_PRESET: self._handle_ptz_preset,
-            CommandCode.PTZ_ZOOM: self._handle_ptz_zoom,
-            CommandCode.PTZ_FOCUS: self._handle_ptz_focus,
-            CommandCode.PTZ_IRIS: self._handle_ptz_iris,
-            CommandCode.PTZ_OTHER: self._handle_ptz_other,
-            CommandCode.GENERAL_CTRL: self._handle_general_ctrl,
-            CommandCode.SPEAK_AUDIO: self._handle_speak_audio,
-            CommandCode.PLAYBACK_CTRL: self._handle_playback_ctrl,
-        }
-
-    def start(self):
-        """Start the UDP server."""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.host, self.port))
-        self.running = True
-
-        logger.info(f"V380 MCP Server listening on {self.host}:{self.port}")
-
-        # Start keepalive monitor thread
-        threading.Thread(target=self._keepalive_monitor, daemon=True).start()
-
-        # Main receive loop
-        while self.running:
-            try:
-                data, addr = self.sock.recvfrom(65535)
-                threading.Thread(
-                    target=self._handle_packet, args=(data, addr), daemon=True
-                ).start()
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Receive error: {e}")
-
-    def stop(self):
-        """Stop the server."""
-        self.running = False
-        if self.sock:
-            self.sock.close()
-
-    def _handle_packet(self, data: bytes, addr: tuple):
-        """Process incoming UDP packet."""
-        try:
-            # Try to parse as JSON command
-            text = data.decode("utf-8")
-            msg = json.loads(text)
-            self._handle_command(msg, addr)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            # Binary frame data
-            self._handle_frame_data(data, addr)
-
-    def _handle_command(self, msg: dict, addr: tuple):
-        """Handle JSON command message."""
-        cmd = msg.get("cmd", 0)
-        seq = msg.get("seq", 0)
-        auth = msg.get("auth", {})
-
-        # Validate session
-        sid = auth.get("sid")
-        session = self._get_session(sid, addr) if sid else None
-
-        handler = self.command_handlers.get(cmd)
-        if handler:
-            response = handler(msg, session, addr)
-        else:
-            response = {"ret": -9, "error": f"Unknown command: 0x{cmd:04x}"}
-
-        response["seq"] = seq
-        response["cmd"] = cmd
-        self._send_response(response, addr)
-
-    def _handle_frame_data(self, data: bytes, addr: tuple):
-        """Handle incoming video frame data."""
-        if len(data) < 20:
-            return
-
-        header = FrameHeader.parse(data)
-        frame_data = data[20:20 + header.size]
-
-        # Find session for this address
-        session_key = f"{addr[0]}:{addr[1]}"
-        session = self.sessions.get(session_key)
-
-        if session and header.is_key_frame():
-            # Decrypt frame if needed
-            decrypted = self._decrypt_frame(frame_data, header, session)
-            self._on_frame_received(decrypted, header, session)
-
-    def _decrypt_frame(self, data: bytes, header: FrameHeader, session: Session) -> bytes:
-        """Decrypt frame using iotc cipher (placeholder)."""
-        # TODO: Implement AES-128-CBC decryption with session.skey
-        # This would call iotc_ms_frame_cipher equivalent
-        return data
-
-    def _on_frame_received(self, data: bytes, header: FrameHeader, session: Session):
-        """Callback for received frame - override in subclass."""
-        logger.debug(f"Frame: type={header.frame_type}, size={len(data)}, key={header.is_key_frame()}")
-
-    def _get_session(self, sid: int, addr: tuple) -> Optional[Session]:
-        """Get or create session."""
-        session_key = f"{addr[0]}:{addr[1]}"
-        if session_key in self.sessions:
-            session = self.sessions[session_key]
-            if session.sid == sid:
-                return session
-        return None
-
-    def _send_response(self, response: dict, addr: tuple):
-        """Send JSON response."""
-        data = json.dumps(response).encode("utf-8")
-        if self.sock:
-            self.sock.sendto(data, addr)
-
-    # Command Handlers
-    def _handle_keepalive(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        if session:
-            session.last_keepalive = time.time()
-            # Refresh token
-            new_token = hashlib.md5(f"{session.sid}{time.time()}".encode()).hexdigest()[:16]
-            session.token = new_token
-            return {"ret": 0, "token": new_token}
-        return {"ret": -6, "error": "No session"}
-
-    def _handle_ptz_action(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        params = msg.get("params", {})
-        action = params.get("action", "stop")
-        logger.info(f"PTZ Action: {action}, pan={params.get('pan')}, tilt={params.get('tilt')}")
-        return {"ret": 0, "action": action}
-
-    def _handle_ptz_preset(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        params = msg.get("params", {})
-        action = params.get("action", "goto")
-        preset_id = params.get("preset_id", 1)
-        logger.info(f"PTZ Preset: {action} #{preset_id}")
-        return {"ret": 0, "preset_id": preset_id}
-
-    def _handle_ptz_zoom(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        level = msg.get("params", {}).get("zoom_level", 0)
-        logger.info(f"PTZ Zoom: {level}")
-        return {"ret": 0, "zoom": level}
-
-    def _handle_ptz_focus(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        params = msg.get("params", {})
-        level = params.get("focus_level", 0)
-        auto = params.get("auto", True)
-        logger.info(f"PTZ Focus: {level}, auto={auto}")
-        return {"ret": 0, "focus": level}
-
-    def _handle_ptz_iris(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        level = msg.get("params", {}).get("iris_level", 0)
-        logger.info(f"PTZ Iris: {level}")
-        return {"ret": 0, "iris": level}
-
-    def _handle_ptz_other(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        action_id = msg.get("params", {}).get("action_id", 0)
-        logger.info(f"PTZ Other: {action_id}")
-        return {"ret": 0, "action_id": action_id}
-
-    def _handle_general_ctrl(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        params = msg.get("params", {})
-        action = params.get("action", "")
-        logger.info(f"General Ctrl: {action}")
-        return {"ret": 0, "action": action}
-
-    def _handle_speak_audio(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        logger.info("Speak Audio received")
-        return {"ret": 0}
-
-    def _handle_playback_ctrl(self, msg: dict, session: Optional[Session], addr: tuple) -> dict:
-        params = msg.get("params", {})
-        action = params.get("action", "")
-        logger.info(f"Playback Ctrl: {action}")
-        return {"ret": 0, "action": action}
-
-    def _keepalive_monitor(self):
-        """Monitor session keepalives."""
-        while self.running:
-            time.sleep(5)
-            now = time.time()
-            expired = [
-                k for k, s in self.sessions.items()
-                if now - s.last_keepalive > 10  # 10 sec timeout
-            ]
-            for k in expired:
-                logger.info(f"Session expired: {k}")
-                del self.sessions[k]
+        _camera_client = V380ProtocolClient(config)
+        if not _camera_client.connect():
+            raise RuntimeError(f"Failed to connect to camera at {config.ip}:{config.port}")
+        logger.info("Camera connected successfully")
+    return _camera_client
 
 
-def main():
-    server = V380MCPServer()
+@asynccontextmanager
+async def lifespan(app: FastMCP):
+    """Application lifespan - connect on startup, disconnect on shutdown."""
+    global _camera_client
+    # Startup
     try:
-        server.start()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        server.stop()
+        get_camera_client()
+    except Exception as e:
+        logger.error(f"Failed to connect to camera on startup: {e}")
+    yield
+    # Shutdown
+    if _camera_client:
+        _camera_client.disconnect()
+        _camera_client = None
+
+
+# Create FastMCP server
+mcp = FastMCP("V380 Camera", lifespan=lifespan)
+
+
+@mcp.tool()
+def check_connection() -> Dict[str, Any]:
+    """
+    Check camera connection status and session health.
+    
+    Returns:
+        Dict with connection status, session info, and queue size.
+    """
+    client = get_camera_client()
+    return client.check_connection()
+
+
+@mcp.tool()
+def get_frame(timeout: float = 5.0, as_base64: bool = True) -> Dict[str, Any]:
+    """
+    Get a video frame from the camera.
+    
+    Args:
+        timeout: Maximum time to wait for a frame (seconds)
+        as_base64: If True, return frame as base64 string; else return raw bytes info
+    
+    Returns:
+        Dict with frame data (base64 or info), header metadata, and timestamp.
+    """
+    client = get_camera_client()
+    frame = client.get_frame(timeout=timeout)
+    
+    if frame is None:
+        return {"error": "No frame received within timeout", "timeout": timeout}
+    
+    header = frame["header"]
+    data = frame["data"]
+    
+    result = {
+        "frame_type": header.frame_type,
+        "is_key_frame": header.is_key_frame(),
+        "size": len(data),
+        "timestamp": frame["timestamp"],
+        "flags": {"f1": header.flags1, "f2": header.flags2},
+        "ts": (header.ts_high << 32) | header.ts_low
+    }
+    
+    if as_base64:
+        import base64
+        result["data_base64"] = base64.b64encode(data).decode("ascii")
+    else:
+        result["data_info"] = f"{len(data)} bytes (use as_base64=true to get data)"
+    
+    return result
+
+
+@mcp.tool()
+def get_latest_frame(as_base64: bool = True) -> Dict[str, Any]:
+    """
+    Get the most recent video frame (non-blocking, drops older frames).
+    
+    Args:
+        as_base64: If True, return frame as base64 string
+    
+    Returns:
+        Dict with frame data and metadata, or error if no frame available.
+    """
+    client = get_camera_client()
+    frame = client.get_latest_frame()
+    
+    if frame is None:
+        return {"error": "No frame available"}
+    
+    header = frame["header"]
+    data = frame["data"]
+    
+    result = {
+        "frame_type": header.frame_type,
+        "is_key_frame": header.is_key_frame(),
+        "size": len(data),
+        "timestamp": frame["timestamp"],
+        "flags": {"f1": header.flags1, "f2": header.flags2},
+        "ts": (header.ts_high << 32) | header.ts_low
+    }
+    
+    if as_base64:
+        import base64
+        result["data_base64"] = base64.b64encode(data).decode("ascii")
+    
+    return result
+
+
+@mcp.tool()
+def snapshot(as_base64: bool = True) -> Dict[str, Any]:
+    """
+    Capture a single snapshot/image from the camera.
+    
+    Args:
+        as_base64: If True, return image as base64 string
+    
+    Returns:
+        Dict with image data or error.
+    """
+    client = get_camera_client()
+    img_data = client.snapshot()
+    
+    if img_data is None:
+        return {"error": "Failed to capture snapshot"}
+    
+    if as_base64:
+        import base64
+        return {
+            "image_base64": base64.b64encode(img_data).decode("ascii"),
+            "size": len(img_data)
+        }
+    else:
+        return {"size": len(img_data), "info": "Use as_base64=true to get image data"}
+
+
+@mcp.tool()
+def send_ptz(
+    action: str,
+    pan: int = 0,
+    tilt: int = 0,
+    zoom: int = 0,
+    speed: int = 5,
+    preset: int = 0
+) -> Dict[str, Any]:
+    """
+    Send PTZ (Pan/Tilt/Zoom) command to camera.
+    
+    Args:
+        action: One of "move", "stop", "preset", "zoom", "focus", "iris"
+        pan: Pan position (-100 to 100), positive = right
+        tilt: Tilt position (-100 to 100), positive = up
+        zoom: Zoom level (0 to 100)
+        speed: Movement speed (1 to 10)
+        preset: Preset ID for preset actions
+    
+    Returns:
+        Dict with success status.
+    """
+    client = get_camera_client()
+    
+    valid_actions = ["move", "stop", "preset", "zoom", "focus", "iris"]
+    if action not in valid_actions:
+        return {"error": f"Invalid action '{action}'. Valid: {valid_actions}"}
+    
+    success = client.send_ptz(
+        action=action,
+        pan=max(-100, min(100, pan)),
+        tilt=max(-100, min(100, tilt)),
+        zoom=max(0, min(100, zoom)),
+        speed=max(1, min(10, speed)),
+        preset=preset
+    )
+    
+    return {"success": success, "action": action, "params": {
+        "pan": pan, "tilt": tilt, "zoom": zoom, "speed": speed, "preset": preset
+    }}
+
+
+@mcp.tool()
+def ptz_preset(action: str, preset_id: int, name: str = "") -> Dict[str, Any]:
+    """
+    Manage PTZ presets.
+    
+    Args:
+        action: "set" (save current position), "goto" (move to preset), "delete"
+        preset_id: Preset number (1-255)
+        name: Optional name for preset (when setting)
+    
+    Returns:
+        Dict with success status.
+    """
+    client = get_camera_client()
+    
+    valid_actions = ["set", "goto", "delete"]
+    if action not in valid_actions:
+        return {"error": f"Invalid action '{action}'. Valid: {valid_actions}"}
+    
+    if not 1 <= preset_id <= 255:
+        return {"error": "preset_id must be 1-255"}
+    
+    success = client.send_ptz_preset(action=action, preset_id=preset_id, name=name)
+    return {"success": success, "action": action, "preset_id": preset_id, "name": name}
+
+
+@mcp.tool()
+def start_stream() -> Dict[str, Any]:
+    """Start video streaming from camera."""
+    client = get_camera_client()
+    success = client.start_stream()
+    return {"success": success, "message": "Stream started" if success else "Failed to start stream"}
+
+
+@mcp.tool()
+def stop_stream() -> Dict[str, Any]:
+    """Stop video streaming from camera."""
+    client = get_camera_client()
+    success = client.stop_stream()
+    return {"success": success, "message": "Stream stopped" if success else "Failed to stop stream"}
+
+
+@mcp.tool()
+def refresh_session() -> Dict[str, Any]:
+    """Manually trigger session token refresh."""
+    client = get_camera_client()
+    # Access internal method
+    try:
+        client._refresh_token()
+        return {"success": True, "message": "Token refreshed"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.resource("camera://status")
+def camera_status() -> str:
+    """Camera status as a resource."""
+    import json
+    client = get_camera_client()
+    status = client.check_connection()
+    return json.dumps(status, indent=2)
+
+
+@mcp.resource("camera://config")
+def camera_config() -> str:
+    """Camera configuration (sanitized)."""
+    import json
+    config = CameraConfig()
+    return json.dumps({
+        "ip": config.ip,
+        "port": config.port,
+        "uid": config.uid,
+        "username": config.username,
+        "has_password": bool(config.password),
+        "use_ssl": config.use_ssl
+    }, indent=2)
 
 
 if __name__ == "__main__":
-    main()
+    mcp.run()

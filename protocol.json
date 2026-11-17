@@ -1,112 +1,40 @@
 {
-  "protocol": "V380 Camera Protocol",
+  "protocol": "V380 Camera Protocol (Aliothings/AliOS Things variant)",
   "version": "1.0",
-  "transport": "UDP",
-  "default_port": 5050,
-  "default_domain": "123.nvdvr.net",
-  "encryption": "AES-128-CBC (iotc cipher)",
-  "command_codes": {
-    "0x30200": {
-      "name": "SPEAK_AUDIO",
-      "description": "Send audio data for two-way talk",
-      "direction": "client->camera",
-      "params": ["audio_data", "format", "sample_rate"]
-    },
-    "0x3030a": {
-      "name": "KEEP_ALIVE",
-      "description": "Heartbeat to maintain session",
-      "direction": "bidirectional",
-      "interval_ms": 4000,
-      "params": ["status"],
-      "response": ["ret", "token"]
-    },
-    "0x30300": {
-      "name": "GENERAL_CTRL",
-      "description": "General control commands",
-      "direction": "client->camera",
-      "params": ["action", "value"]
-    },
-    "0x30308": {
-      "name": "PTZ_ACTION",
-      "description": "PTZ movement and control",
-      "direction": "client->camera",
-      "params": ["action", "pan", "tilt", "zoom", "speed", "preset_id"],
-      "actions": ["move", "stop", "preset", "zoom", "focus", "iris"]
-    },
-    "0x30202": {
-      "name": "PTZ_PRESET",
-      "description": "PTZ preset management",
-      "direction": "client->camera",
-      "params": ["action", "preset_id", "name"],
-      "actions": ["set", "goto", "delete"]
-    },
-    "0x30222": {
-      "name": "PLAYBACK_CTRL",
-      "description": "Playback control for recordings",
-      "direction": "client->camera",
-      "params": ["action", "timestamp", "speed"]
-    },
-    "0x60200": {
-      "name": "PTZ_ZOOM",
-      "description": "Zoom control",
-      "direction": "client->camera",
-      "params": ["zoom_level"]
-    },
-    "0x60201": {
-      "name": "PTZ_FOCUS",
-      "description": "Focus control",
-      "direction": "client->camera",
-      "params": ["focus_level", "auto"]
-    },
-    "0x60203": {
-      "name": "PTZ_IRIS",
-      "description": "Iris control",
-      "direction": "client->camera",
-      "params": ["iris_level"]
-    },
-    "0x60204": {
-      "name": "PTZ_OTHER",
-      "description": "Other PTZ actions",
-      "direction": "client->camera",
-      "params": ["action_id"]
-    }
+  "analysis_source": "REA/Ghidra analysis of libhsMediaLibrary.so, libhsUtils.so, libnms.so, libzerolink.so from com.macrovideo.v380pro.apk",
+  "transport": {
+    "control": "TCP",
+    "video": "UDP",
+    "default_port": 5050,
+    "discovery": "NOT NVDEVSEARCH^100 - uses MQTT/P2P"
   },
-  "frame_types": {
-    "0": "I_FRAME",
-    "2": "P_FRAME",
-    "9": "IDR_FRAME",
-    "36": "SPS_PPS",
-    "40": "SEI",
-    "50": "AUD",
-    "52": "FILLER"
-  },
-  "key_frame_types": [0, 2, 9, 36, 40, 50, 52],
   "session_management": {
-    "login_handle_fields": [
-      "mlHandle", "mnDeviceID", "mlTokenSession", "sid",
-      "sKey", "pKeyByte", "mstrIP", "mstrLanIP",
-      "mnPort", "mstrDomain", "mbInLan"
+    "login": "LoginHelper.login(context, deviceInfo, 5) for P2P",
+    "key_exchange": [
+      "LoginHelper.keyExchangeFromMqSync",
+      "LoginHelper.keyExchangeByLanSync",
+      "LoginHelper.keyExchangeFromHttpsSync"
     ],
-    "refresh_functions": [
+    "token_refresh": [
       "refreshIpPortHandleToken",
-      "refreshSession",
-      "refreshMqKeyExchangeInfo",
       "refreshIpPortHandleTokenSession",
       "refreshIpPortHandleTokenUuid",
-      "updateLoginHandle"
-    ]
-  },
-  "frame_header": {
-    "size": 20,
-    "fields": [
-      {"name": "offset", "offset": 16, "type": "uint32"},
-      {"name": "size", "offset": 20, "type": "uint32"},
-      {"name": "type", "offset": 24, "type": "uint8"},
-      {"name": "flags1", "offset": 25, "type": "uint8"},
-      {"name": "flags2", "offset": 26, "type": "uint8"},
-      {"name": "ts_low", "offset": 28, "type": "uint32"},
-      {"name": "ts_high", "offset": 32, "type": "uint32"}
-    ]
+      "refreshMqKeyExchangeInfo"
+    ],
+    "structures": {
+      "LoginHandle": {
+        "mlHandle": "long (native handle)",
+        "mnDeviceID": "int",
+        "mlTokenSession": "long",
+        "sid": "int (session ID)",
+        "sKey": "byte[16] (AES key)",
+        "pKeyByte": "byte[] (public key)",
+        "mstrIP": "string (camera IP)",
+        "mnPort": "int (default 5050)",
+        "mstrDomain": "string (default 123.nvdvr.net)",
+        "mbInLan": "boolean"
+      }
+    }
   },
   "encryption": {
     "algorithm": "AES-128-CBC",
@@ -115,35 +43,109 @@
     "functions": [
       "iotc_ms_frame_cipher_init",
       "iotc_ms_frame_cipher",
-      "iotc_ms_frame_cipher_end"
+      "iotc_ms_frame_cipher_end",
+      "media_data_decrypt",
+      "media_data_encrypt",
+      "mvt_cipher_start",
+      "mvt_cipher_process",
+      "mvt_cipher_finish"
     ]
   },
-  "audio": {
-    "codec": "ADPCM",
-    "sample_rate": 8000,
-    "channels": 1,
-    "functions": ["AdpcmEncode", "AdpcmDecode", "sample8kTo16k"]
+  "video": {
+    "frame_header": {
+      "size": 20,
+      "fields": [
+        {"name": "offset", "offset": 16, "type": "uint32"},
+        {"name": "size", "offset": 20, "type": "uint32"},
+        {"name": "frame_type", "offset": 24, "type": "uint8"},
+        {"name": "flags1", "offset": 25, "type": "uint8"},
+        {"name": "flags2", "offset": 26, "type": "uint8"},
+        {"name": "ts_low", "offset": 28, "type": "uint32"},
+        {"name": "ts_high", "offset": 32, "type": "uint32"}
+      ]
+    },
+    "frame_types": {
+      "0": "I_FRAME",
+      "2": "P_FRAME",
+      "9": "IDR_FRAME",
+      "36": "SPS_PPS",
+      "40": "SEI",
+      "50": "AUD",
+      "52": "FILLER"
+    },
+    "key_frame_types": [0, 2, 9, 36, 40, 50, 52],
+    "fifo_queue": {
+      "capacity": 100,
+      "frame_header_size": 20,
+      "functions": ["PutFIFOVedioData", "GetFIFOData", "InitFIFOQueueManager"]
+    }
   },
   "ptz": {
-    "setPTZParam_params": 11,
-    "setPTZXParam_params": 3,
-    "range": {
+    "setPTZParam": {
+      "params": 11,
+      "signature": "setPTZParam(handle, cmd, bool1, param1, bool2, param2, bool3, bool4, bool5, bool6, param3)"
+    },
+    "setPTZXParam": {
+      "params": 3,
+      "signature": "setPTZXParam(handle, param1, param2, param3)"
+    },
+    "ranges": {
       "pan": [-100, 100],
       "tilt": [-100, 100],
       "zoom": [0, 100],
-      "speed": [1, 10]
+      "speed": [1, 10],
+      "preset": [1, 255]
     }
   },
-  "error_codes": {
-    "0": "SUCCESS",
-    "-1": "GENERIC_FAILURE",
-    "-2": "INVALID_PARAMETER",
-    "-3": "NOT_CONNECTED",
-    "-4": "TIMEOUT",
-    "-5": "AUTH_FAILED",
-    "-6": "SESSION_EXPIRED",
-    "-7": "ENCRYPTION_ERROR",
-    "-8": "BUFFER_FULL",
-    "-9": "NOT_SUPPORTED"
+  "commands": {
+    "control": {
+      "0x1001": "REFRESH_TOKEN",
+      "0x1002": "REFRESH_SESSION",
+      "0x1003": "KEY_EXCHANGE"
+    },
+    "video": {
+      "0x2001": "START_PLAY",
+      "0x2002": "STOP_PLAY",
+      "0x2003": "START_PLAYBACK",
+      "0x2004": "STOP_PLAYBACK",
+      "0x2005": "GET_SNAPSHOT"
+    },
+    "ptz": {
+      "0x3001": "PTZ_PARAM",
+      "0x3002": "PTZ_X_PARAM",
+      "0x3003": "PTZ_PRESET",
+      "0x3004": "PTZ_CRUISE"
+    },
+    "audio": {
+      "0x4001": "START_SPEAK",
+      "0x4002": "STOP_SPEAK",
+      "0x4003": "SEND_AUDIO"
+    },
+    "keepalive": {
+      "0x5001": "HEARTBEAT"
+    }
+  },
+  "jni_exports": {
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_startPlay": "0x79e09",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_stopPlay": "0x79f1d",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZParam": "0x7a7cd",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_setPTZXParam": "0x7a619",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_refreshIpPortHandleToken": "0x807b9",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_refreshMqKeyExchangeInfo": "0x80add",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_updateLoginHandle": "0x7d3ad",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_cipherFileData": "0x7f419",
+    "Java_com_macrovideo_sdk_media_HSMediaLibrary_sendSpeakAudioData": "0x7ab01"
+  },
+  "native_symbols": {
+    "HSLiveDataBaseTransmitter::updateLoginHandle": "_ZN25HSLiveDataBaseTransmitter17updateLoginHandleEll",
+    "HSLiveDataBaseTransmitter::refreshIpPortHandleToken": "_ZN25HSLiveDataBaseTransmitter24refreshIpPortHandleTokenEPKcS1_iiS1_",
+    "HSLiveDataBaseTransmitter::refreshMqKeyExchangeInfo": "_ZN25HSLiveDataBaseTransmitter24refreshMqKeyExchangeInfoEPKcS1_S1_",
+    "HSLiveDataBaseTransmitter::callbackMqErrorStartP2p": "_ZN25HSLiveDataBaseTransmitter23callbackMqErrorStartP2pEv",
+    "iotc_ms_frame_cipher_init": "_Z25iotc_ms_frame_cipher_initP30_media_stream_frame_trans_infohhPhS1_",
+    "iotc_ms_frame_cipher": "_Z20iotc_ms_frame_cipherP30_media_stream_frame_trans_infoh",
+    "iotc_ms_frame_cipher_end": "_Z24iotc_ms_frame_cipher_endP30_media_stream_frame_trans_info",
+    "mr_tcp_connect": "mr_tcp_connect",
+    "media_data_decrypt": "media_data_decrypt",
+    "media_data_encrypt": "media_data_encrypt"
   }
 }
